@@ -1,0 +1,175 @@
+---
+title: "ATMP survival extrapolation"
+output: html_notebook
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(Hmisc)
+library(flexsurv)
+```
+
+
+## Figure 1
+
+```{r}
+#### My version
+## Params
+shap = 1.2
+scal = 2.6
+
+## Functions
+haz_rate = function(x, t, out = "prob"){ # Function to convert between rates and probability
+  tmp  = t - lag(t, default = 0)
+  if (out == "rate"){
+    y = - (log(1 - x)) / tmp
+  } else if (out == "prob") {
+    y = 1 - exp(- x * tmp)
+  } else {
+    "error!"
+  }
+  return (y)
+}
+
+## Life table data
+# Data for simulating gen-pop survival times (63 year-olds in 2017).
+gen_pop <- read.csv("../data/nationallifetables3yearuk_2017-2019_male.csv",
+                    col.names = c("age", "mx", "qx", "lx", "dx", "ex")) %>% 
+  mutate(age2 = as.factor(age), 
+         years = as.numeric(levels(age2))[age2] - 63,
+         hazard = haz_rate(qx, years + 0.5, "rate")) %>% 
+  filter(years >= 0) %>% 
+  mutate(cum_haz = cumsum(hazard),
+         cum_fail = haz_rate(cum_haz, years + 0.5, "prob"), 
+         surv = (lx - dx) / lx[1])
+
+## Survival
+df_tru = gen_pop %>% 
+  select(time = years, haz_gen = hazard, surv_gen = surv) %>%
+  mutate(time = time + 0.5,
+         surv_uncured = pweibull(time, shape=shap, scale=scal, lower.tail=FALSE),
+         surv_25 = surv_gen * .25 + surv_uncured * (1 - .25),
+         surv_50 = surv_gen * .50 + surv_uncured * (1 - .50),
+         surv_75 = surv_gen * .75 + surv_uncured * (1 - .75),
+         haz_uncured = hweibull(time, shap, scal),
+         haz_25 = (haz_gen * surv_gen * .25 + haz_uncured * surv_uncured * (1 - .25)) / 
+           (surv_gen * .25 + surv_uncured * (1 - .25)),
+         haz_50 = (haz_gen * surv_gen * .50 + haz_uncured * surv_uncured * (1 - .50)) / 
+           (surv_gen * .50 + surv_uncured * (1 - .50)),
+         haz_75 = (haz_gen * surv_gen * .75 + haz_uncured * surv_uncured * (1 - .75)) / 
+           (surv_gen * .75 + surv_uncured * (1 - .75))) 
+
+df_tru %>% 
+  pivot_longer(cols = c(starts_with("surv"), starts_with("haz")), names_to = "type") %>% 
+  mutate(Population = case_when(str_detect(type, "gen") ~ "General",
+                          str_detect(type, "uncured") ~ "Uncured",
+                          str_detect(type, "25") ~ "25% Cure",
+                          str_detect(type, "50") ~ "50% Cure",
+                          str_detect(type, "75") ~ "75% Cure"),
+         type = case_when(str_detect(type, "surv") ~ "Survival",
+                          str_detect(type, "haz") ~ "Hazard")) %>% 
+  ggplot(aes(x = time)) +
+  geom_line(aes(y = value, col = Population)) +
+  facet_wrap(~type, scales = "free") +
+  xlab("Time") +
+  ylab("Value") +
+  ggthemes::theme_few() +
+  theme(legend.position = "top")
+
+ggsave("../../figures/figure_1.tiff")
+```
+
+
+```{r}
+df_tru %>% 
+  pivot_longer(cols = c(starts_with("surv"), starts_with("haz")), names_to = "type") %>% 
+  mutate(Population = case_when(str_detect(type, "gen") ~ "General",
+                          str_detect(type, "uncured") ~ "Uncured",
+                          str_detect(type, "25") ~ "25% Cure",
+                          str_detect(type, "50") ~ "50% Cure",
+                          str_detect(type, "75") ~ "75% Cure"),
+         type = case_when(str_detect(type, "surv") ~ "Survival",
+                          str_detect(type, "haz") ~ "Hazard")) %>% 
+  filter(type == "Hazard" & Population == "25% Cure") %>% 
+  ggplot(aes(x = time)) +
+  geom_line(aes(y = value)) +
+  ylab("Hazard") +
+  xlab("Time")
+```
+
+
+## Figure 2
+
+```{r, figure-2}
+### Hazard and survival plot
+df_tru %>% 
+  select(time, haz_50) %>% 
+  # Fit RCS models k 3:5 to the hazard function for 50% cure popn
+  bind_cols(map_dfc(.x = 3:6, # Range of knot specifications
+                    .f = function(.x){
+                      x <- df_tru$time
+                      y <- df_tru$haz_50
+                      xx <- rcspline.eval(x, inclx=TRUE, nk=.x)
+                      knots <- attr(xx, "knots")
+                      coef <- lsfit(xx, y)$coef
+                      options(digits = 4)
+                      # rcspline.restate must ignore intercept
+                      w <- rcspline.restate(knots, coef[-1], x="{\\rm BP}")
+                      # could also have used coef instead of coef[-1], to include intercept
+                      
+                      xtrans <- eval(attr(w, "function"))
+                      # # This is an S function of a single argument
+                      # 
+                      xtrans <- rcsplineFunction(knots, coef)
+                      # 
+                      tibble("haz_RCSk_{{.x}}" := xtrans(df_tru$time)) # Dynamic naming
+                    })) %>% 
+  mutate(haz_true = haz_50,
+         cum_haz_true = cumsum(`haz_true`),
+         cum_fail_true = haz_rate(cum_haz_true, time, "prob"), 
+         surv_true = 1-cum_fail_true,
+         # RCS 3 knots
+         cum_haz_RCSk_3L = cumsum(`haz_RCSk_3L`),
+         cum_fail_RCSk_3L = haz_rate(cum_haz_RCSk_3L, time, "prob"), 
+         surv_RCSk_3L = 1-cum_fail_RCSk_3L,
+         # RCS 4 knots
+         cum_haz_RCSk_4L = cumsum(`haz_RCSk_4L`),
+         cum_fail_RCSk_4L = haz_rate(cum_haz_RCSk_4L, time, "prob"), 
+         surv_RCSk_4L = 1-cum_fail_RCSk_4L,
+         # RCS 5 knots
+         cum_haz_RCSk_5L = cumsum(`haz_RCSk_5L`),
+         cum_fail_RCSk_5L = haz_rate(cum_haz_RCSk_5L, time, "prob"), 
+         surv_RCSk_5L = 1-cum_fail_RCSk_5L,
+         # RCS 6 knots
+         cum_haz_RCSk_6L = cumsum(`haz_RCSk_6L`),
+         cum_fail_RCSk_6L = haz_rate(cum_haz_RCSk_6L, time, "prob"), 
+         surv_RCSk_6L = 1-cum_fail_RCSk_6L,
+         ) %>% 
+  pivot_longer(cols = haz_RCSk_3L:surv_RCSk_6L) %>% 
+  mutate(type = case_when(str_detect(name, "cum_haz") ~ "Cumulative hazard",
+                          str_detect(name, "cum_fail") ~ "Cumulative failure",
+                          str_detect(name, "surv") ~ "Survival",
+                          str_detect(name, "haz") ~ "Hazard"),
+         knots = case_when(str_detect(name, "true") ~ "True value",
+                           str_detect(name, "k_3L") ~ "RCS k = 3",
+                           str_detect(name, "k_4L") ~ "RCS k = 4",
+                           str_detect(name, "k_5L") ~ "RCS k = 5",
+                           str_detect(name, "k_6L") ~ "RCS k = 6"),
+         model = if_else(str_detect(knots, "RCS"), TRUE, FALSE)
+         ) %>% 
+  filter(type %in% c("Hazard", "Survival")) %>% 
+  ggplot(aes(x = time)) +
+  geom_vline(aes(xintercept = 2.35), col = "grey") +
+  geom_vline(aes(xintercept = 35.65), col = "grey") +
+  geom_line(aes(y = value, col = knots, lty = model)) +
+  facet_wrap(~type, scales = "free") +
+  xlab("Time") +
+  ylab("Value") +
+  scale_linetype_discrete(breaks = NULL, name = NULL) + # Remove lty from legend
+  scale_color_discrete(name = "Model") +
+  ggthemes::theme_few() +
+  theme(legend.position = "top")
+
+ggsave("../../figures/figure_2.tiff")
+```
+
